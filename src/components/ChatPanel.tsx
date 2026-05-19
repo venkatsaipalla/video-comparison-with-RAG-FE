@@ -1,13 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Citation, streamChat } from "@/lib/api";
 
+type MessageStatus = "complete" | "streaming" | "error";
+
 type Message = {
+  id: string;
   role: "user" | "assistant";
   content: string;
   citations?: Citation[];
+  status: MessageStatus;
 };
 
 const SUGGESTIONS = [
@@ -21,61 +25,107 @@ type Props = {
   disabled?: boolean;
 };
 
+function newId() {
+  return crypto.randomUUID();
+}
+
 export function ChatPanel({ sessionId, disabled }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
-  const [conversationId, setConversationId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
 
-  async function send(text: string) {
-    if (!text.trim() || streaming || disabled) return;
-    setError(null);
-    const userMsg: Message = { role: "user", content: text.trim() };
-    setMessages((m) => [...m, userMsg]);
-    setInput("");
-    setStreaming(true);
+  const updateMessage = useCallback((id: string, patch: Partial<Message>) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
+    );
+  }, []);
 
-    let assistant = "";
-    const citations: Citation[] = [];
+  const send = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || streaming || disabled) return;
 
-    setMessages((m) => [...m, { role: "assistant", content: "", citations: [] }]);
+      setError(null);
+      setStreaming(true);
 
-    await streamChat(sessionId, text.trim(), conversationId, {
-      onToken: (t) => {
-        assistant += t;
-        setMessages((m) => {
-          const copy = [...m];
-          copy[copy.length - 1] = {
-            role: "assistant",
-            content: assistant,
+      const assistantId = newId();
+
+      setMessages((prev) => [
+        ...prev,
+        { id: newId(), role: "user", content: trimmed, status: "complete" },
+        {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          citations: [],
+          status: "streaming",
+        },
+      ]);
+      setInput("");
+
+      let assistantText = "";
+      const citations: Citation[] = [];
+      let finished = false;
+
+      try {
+        await streamChat(
+          sessionId,
+          trimmed,
+          conversationIdRef.current,
+          {
+            onToken: (t) => {
+              assistantText += t;
+              updateMessage(assistantId, {
+                content: assistantText,
+                citations: [...citations],
+              });
+            },
+            onCitation: (c) => {
+              citations.push(c);
+              updateMessage(assistantId, {
+                content: assistantText,
+                citations: [...citations],
+              });
+            },
+            onDone: (data) => {
+              finished = true;
+              conversationIdRef.current = data.conversation_id;
+              updateMessage(assistantId, {
+                content: assistantText || "No response generated.",
+                citations: [...citations],
+                status: "complete",
+              });
+            },
+            onError: (msg) => {
+              finished = true;
+              setError(msg);
+              updateMessage(assistantId, {
+                content: assistantText || msg,
+                status: "error",
+              });
+            },
+          }
+        );
+
+        if (!finished) {
+          updateMessage(assistantId, {
+            content: assistantText || "No response received from server.",
             citations: [...citations],
-          };
-          return copy;
-        });
-      },
-      onCitation: (c) => {
-        citations.push(c);
-        setMessages((m) => {
-          const copy = [...m];
-          copy[copy.length - 1] = {
-            role: "assistant",
-            content: assistant,
-            citations: [...citations],
-          };
-          return copy;
-        });
-      },
-      onDone: (data) => {
-        setConversationId(data.conversation_id);
-        setStreaming(false);
-      },
-      onError: (msg) => {
+            status: assistantText ? "complete" : "error",
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Chat failed";
         setError(msg);
+        updateMessage(assistantId, { content: msg, status: "error" });
+      } finally {
         setStreaming(false);
-      },
-    });
-  }
+      }
+    },
+    [disabled, sessionId, streaming, updateMessage]
+  );
 
   return (
     <div className="flex h-full min-h-[480px] flex-col rounded-2xl border border-stone-800 bg-stone-900/80">
@@ -107,9 +157,9 @@ export function ChatPanel({ sessionId, disabled }: Props) {
             improvement ideas.
           </p>
         )}
-        {messages.map((msg, i) => (
+        {messages.map((msg) => (
           <div
-            key={i}
+            key={msg.id}
             className={
               msg.role === "user"
                 ? "ml-8 rounded-lg bg-brand-600/20 p-3 text-sm"
@@ -117,9 +167,21 @@ export function ChatPanel({ sessionId, disabled }: Props) {
             }
           >
             {msg.role === "assistant" ? (
-              <ReactMarkdown className="prose prose-invert prose-sm max-w-none">
-                {msg.content || "…"}
-              </ReactMarkdown>
+              <>
+                {msg.status === "streaming" && !msg.content ? (
+                  <div className="flex items-center gap-2 text-stone-400">
+                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-brand-500" />
+                    <span>Thinking…</span>
+                  </div>
+                ) : msg.content ? (
+                  <ReactMarkdown className="prose prose-invert prose-sm max-w-none">
+                    {msg.content}
+                  </ReactMarkdown>
+                ) : null}
+                {msg.status === "error" && (
+                  <p className="mt-1 text-xs text-red-400">Response failed</p>
+                )}
+              </>
             ) : (
               msg.content
             )}
@@ -173,7 +235,7 @@ export function ChatPanel({ sessionId, disabled }: Props) {
             disabled={disabled || streaming || !input.trim()}
             className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-40"
           >
-            Send
+            {streaming ? "Sending…" : "Send"}
           </button>
         </div>
       </form>

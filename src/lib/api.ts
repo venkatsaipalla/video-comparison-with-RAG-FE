@@ -71,6 +71,51 @@ export async function getSessionStatus(
   return res.json();
 }
 
+/** Parse one SSE block (events separated by blank lines). */
+function dispatchSseBlock(
+  block: string,
+  handlers: {
+    onToken: (text: string) => void;
+    onCitation: (citation: Citation) => void;
+    onDone: (data: { message_id: string; conversation_id: string }) => void;
+    onError: (message: string) => void;
+  }
+) {
+  let eventType = "message";
+  const dataParts: string[] = [];
+
+  for (const rawLine of block.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      eventType = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataParts.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (dataParts.length === 0) return;
+
+  const raw = dataParts.join("\n");
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    handlers.onError(`Invalid server data: ${raw.slice(0, 120)}`);
+    return;
+  }
+
+  if (eventType === "token" && typeof data.text === "string") {
+    handlers.onToken(data.text);
+  } else if (eventType === "citation") {
+    handlers.onCitation(data as Citation);
+  } else if (eventType === "done") {
+    handlers.onDone(data as { message_id: string; conversation_id: string });
+  } else if (eventType === "error") {
+    handlers.onError(String(data.message ?? "Chat error"));
+  }
+}
+
 export async function streamChat(
   sessionId: string,
   message: string,
@@ -82,51 +127,63 @@ export async function streamChat(
     onError: (message: string) => void;
   }
 ): Promise<void> {
-  const res = await fetch(`${API_URL}/sessions/${sessionId}/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify({
-      message,
-      conversation_id: conversationId,
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/sessions/${sessionId}/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify({
+        message,
+        conversation_id: conversationId,
+      }),
+    });
+  } catch {
+    handlers.onError("Network error — is the API running?");
+    return;
+  }
 
-  if (!res.ok || !res.body) {
-    handlers.onError("Chat request failed");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = err.detail;
+    handlers.onError(
+      typeof detail === "string" ? detail : `Chat failed (${res.status})`
+    );
+    return;
+  }
+
+  if (!res.body) {
+    handlers.onError("No response stream from server");
     return;
   }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let eventType = "message";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, "\n");
 
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventType = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        const raw = line.slice(5).trim();
-        try {
-          const data = JSON.parse(raw);
-          if (eventType === "token") handlers.onToken(data.text);
-          else if (eventType === "citation") handlers.onCitation(data);
-          else if (eventType === "done") handlers.onDone(data);
-          else if (eventType === "error") handlers.onError(data.message);
-        } catch {
-          /* ignore parse errors */
-        }
+      let sep = buffer.indexOf("\n\n");
+      while (sep !== -1) {
+        const block = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        if (block.trim()) dispatchSseBlock(block, handlers);
+        sep = buffer.indexOf("\n\n");
       }
     }
+
+    if (buffer.trim()) {
+      dispatchSseBlock(buffer, handlers);
+    }
+  } catch {
+    handlers.onError("Stream interrupted");
   }
 }
 
