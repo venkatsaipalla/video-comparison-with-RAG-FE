@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { Citation, streamChat } from "@/lib/api";
+import { Citation, citationsFromState, sendChat } from "@/lib/api";
 
 type MessageStatus = "complete" | "streaming" | "error";
 
@@ -22,6 +22,7 @@ const SUGGESTIONS = [
 
 type Props = {
   sessionId: string;
+  videoIds: string[];
   disabled?: boolean;
 };
 
@@ -29,27 +30,19 @@ function newId() {
   return crypto.randomUUID();
 }
 
-export function ChatPanel({ sessionId, disabled }: Props) {
+export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const conversationIdRef = useRef<string | null>(null);
-
-  const updateMessage = useCallback((id: string, patch: Partial<Message>) => {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
-    );
-  }, []);
 
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || streaming || disabled) return;
+      if (!trimmed || loading || disabled) return;
 
       setError(null);
-      setStreaming(true);
-
+      setLoading(true);
       const assistantId = newId();
 
       setMessages((prev) => [
@@ -65,66 +58,37 @@ export function ChatPanel({ sessionId, disabled }: Props) {
       ]);
       setInput("");
 
-      let assistantText = "";
-      const citations: Citation[] = [];
-      let finished = false;
-
       try {
-        await streamChat(
-          sessionId,
-          trimmed,
-          conversationIdRef.current,
-          {
-            onToken: (t) => {
-              assistantText += t;
-              updateMessage(assistantId, {
-                content: assistantText,
-                citations: [...citations],
-              });
-            },
-            onCitation: (c) => {
-              citations.push(c);
-              updateMessage(assistantId, {
-                content: assistantText,
-                citations: [...citations],
-              });
-            },
-            onDone: (data) => {
-              finished = true;
-              conversationIdRef.current = data.conversation_id;
-              updateMessage(assistantId, {
-                content: assistantText || "No response generated.",
-                citations: [...citations],
-                status: "complete",
-              });
-            },
-            onError: (msg) => {
-              finished = true;
-              setError(msg);
-              updateMessage(assistantId, {
-                content: assistantText || msg,
-                status: "error",
-              });
-            },
-          }
-        );
+        const { answer, state } = await sendChat(sessionId, trimmed);
+        const citations = citationsFromState(state, videoIds);
 
-        if (!finished) {
-          updateMessage(assistantId, {
-            content: assistantText || "No response received from server.",
-            citations: [...citations],
-            status: assistantText ? "complete" : "error",
-          });
-        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: answer || "No response generated.",
+                  citations,
+                  status: "complete",
+                }
+              : m
+          )
+        );
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Chat failed";
         setError(msg);
-        updateMessage(assistantId, { content: msg, status: "error" });
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? { ...m, content: msg, status: "error" }
+              : m
+          )
+        );
       } finally {
-        setStreaming(false);
+        setLoading(false);
       }
     },
-    [disabled, sessionId, streaming, updateMessage]
+    [disabled, loading, sessionId, videoIds]
   );
 
   return (
@@ -132,7 +96,7 @@ export function ChatPanel({ sessionId, disabled }: Props) {
       <div className="border-b border-stone-800 px-4 py-3">
         <h2 className="font-semibold text-stone-100">AI comparison chat</h2>
         <p className="text-xs text-stone-500">
-          Streaming answers with source citations
+          Answers grounded in retrieved transcript evidence
         </p>
       </div>
 
@@ -141,7 +105,7 @@ export function ChatPanel({ sessionId, disabled }: Props) {
           <button
             key={s}
             type="button"
-            disabled={disabled || streaming}
+            disabled={disabled || loading}
             onClick={() => send(s)}
             className="rounded-full border border-stone-700 px-3 py-1 text-xs text-stone-300 hover:border-brand-500 hover:text-brand-500 disabled:opacity-40"
           >
@@ -225,17 +189,17 @@ export function ChatPanel({ sessionId, disabled }: Props) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={
-              disabled ? "Waiting for ingest…" : "Ask about these videos…"
+              disabled ? "Session unavailable" : "Ask about these videos…"
             }
-            disabled={disabled || streaming}
+            disabled={disabled || loading}
             className="flex-1 rounded-lg border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none focus:border-brand-500"
           />
           <button
             type="submit"
-            disabled={disabled || streaming || !input.trim()}
+            disabled={disabled || loading || !input.trim()}
             className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-40"
           >
-            {streaming ? "Sending…" : "Send"}
+            {loading ? "Sending…" : "Send"}
           </button>
         </div>
       </form>

@@ -1,3 +1,5 @@
+import { getUserId } from "@/lib/user";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export type VideoSummary = {
@@ -28,6 +30,18 @@ export type SessionStatus = {
   video_b: VideoSummary | null;
 };
 
+export type InitResponse = {
+  session_id: string;
+  video_ids: string[];
+  titles: Record<string, string | null>;
+};
+
+export type ChatResponse = {
+  session_id: string;
+  answer: string;
+  state: Record<string, unknown>;
+};
+
 export type Citation = {
   chunk_id: string;
   video_label: string;
@@ -37,154 +51,146 @@ export type Citation = {
   excerpt: string;
 };
 
-export async function createSession(
+type Evidence = {
+  quote?: string;
+  video_id?: string | null;
+  start_time?: number | null;
+  end_time?: number | null;
+};
+
+async function parseError(res: Response, fallback: string): Promise<string> {
+  const err = await res.json().catch(() => ({}));
+  const detail = (err as { detail?: unknown }).detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => (typeof d === "object" && d && "msg" in d ? String(d.msg) : ""))
+      .filter(Boolean)
+      .join(", ");
+  }
+  return fallback;
+}
+
+/**
+ * POST /init — ingest both URLs on GPU, create ADK session, return session_id.
+ * Can take 1–3+ minutes while the retrieval service ingests.
+ */
+export async function initSession(
   videoAUrl: string,
   videoBUrl: string
-): Promise<{ session_id: string; status: string }> {
-  const res = await fetch(`${API_URL}/sessions`, {
+): Promise<InitResponse> {
+  const res = await fetch(`${API_URL}/init`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      video_a_url: videoAUrl,
-      video_b_url: videoBUrl,
+      user_id: getUserId(),
+      urls: [videoAUrl.trim(), videoBUrl.trim()],
     }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    const detail = err.detail;
-    const msg =
-      typeof detail === "string"
-        ? detail
-        : Array.isArray(detail)
-          ? detail.map((d: { msg?: string }) => d.msg).join(", ")
-          : "Failed to create session";
-    throw new Error(msg);
+    throw new Error(await parseError(res, "Failed to start session"));
   }
   return res.json();
 }
 
-export async function getSessionStatus(
-  sessionId: string
-): Promise<SessionStatus> {
-  const res = await fetch(`${API_URL}/sessions/${sessionId}/status`);
-  if (!res.ok) throw new Error("Failed to fetch session status");
+/** POST /chat — full answer (non-streaming). */
+export async function sendChat(
+  sessionId: string,
+  message: string
+): Promise<ChatResponse> {
+  const res = await fetch(`${API_URL}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: getUserId(),
+      session_id: sessionId,
+      message,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(await parseError(res, `Chat failed (${res.status})`));
+  }
   return res.json();
 }
 
-/** Parse one SSE block (events separated by blank lines). */
-function dispatchSseBlock(
-  block: string,
-  handlers: {
-    onToken: (text: string) => void;
-    onCitation: (citation: Citation) => void;
-    onDone: (data: { message_id: string; conversation_id: string }) => void;
-    onError: (message: string) => void;
-  }
-) {
-  let eventType = "message";
-  const dataParts: string[] = [];
-
-  for (const rawLine of block.split("\n")) {
-    const line = rawLine.replace(/\r$/, "");
-    if (!line || line.startsWith(":")) continue;
-    if (line.startsWith("event:")) {
-      eventType = line.slice(6).trim();
-    } else if (line.startsWith("data:")) {
-      dataParts.push(line.slice(5).trimStart());
+function parseAnalysisState(
+  state: Record<string, unknown>
+): Record<string, unknown> | null {
+  let analysis = state.analysis;
+  if (typeof analysis === "string") {
+    try {
+      analysis = JSON.parse(analysis) as unknown;
+    } catch {
+      return null;
     }
   }
-
-  if (dataParts.length === 0) return;
-
-  const raw = dataParts.join("\n");
-  let data: Record<string, unknown>;
-  try {
-    data = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    handlers.onError(`Invalid server data: ${raw.slice(0, 120)}`);
-    return;
-  }
-
-  if (eventType === "token" && typeof data.text === "string") {
-    handlers.onToken(data.text);
-  } else if (eventType === "citation") {
-    handlers.onCitation(data as Citation);
-  } else if (eventType === "done") {
-    handlers.onDone(data as { message_id: string; conversation_id: string });
-  } else if (eventType === "error") {
-    handlers.onError(String(data.message ?? "Chat error"));
-  }
+  if (!analysis || typeof analysis !== "object") return null;
+  return analysis as Record<string, unknown>;
 }
 
-export async function streamChat(
-  sessionId: string,
-  message: string,
-  conversationId: string | null,
-  handlers: {
-    onToken: (text: string) => void;
-    onCitation: (citation: Citation) => void;
-    onDone: (data: { message_id: string; conversation_id: string }) => void;
-    onError: (message: string) => void;
-  }
-): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_URL}/sessions/${sessionId}/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      },
-      body: JSON.stringify({
-        message,
-        conversation_id: conversationId,
-      }),
+/** Pull evidence items from brain `state.analysis` for the sources panel. */
+export function citationsFromState(
+  state: Record<string, unknown>,
+  videoIds: string[]
+): Citation[] {
+  const a = parseAnalysisState(state);
+  if (!a) return [];
+  const labelFor = (videoId: string | null | undefined) => {
+    if (!videoId) return "Video";
+    const i = videoIds.indexOf(videoId);
+    if (i === 0) return "Video A";
+    if (i === 1) return "Video B";
+    return videoId;
+  };
+
+  const out: Citation[] = [];
+  const seen = new Set<string>();
+
+  const add = (ev: Evidence) => {
+    const vid = ev.video_id ?? "";
+    const key = `${vid}:${ev.start_time}:${ev.quote?.slice(0, 40)}`;
+    if (!ev.quote || seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      chunk_id: key,
+      video_label: labelFor(ev.video_id),
+      video_id: vid,
+      start_sec: ev.start_time ?? null,
+      end_sec: ev.end_time ?? null,
+      excerpt: ev.quote.slice(0, 400),
     });
-  } catch {
-    handlers.onError("Network error — is the API running?");
-    return;
-  }
+  };
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    const detail = err.detail;
-    handlers.onError(
-      typeof detail === "string" ? detail : `Chat failed (${res.status})`
-    );
-    return;
-  }
-
-  if (!res.body) {
-    handlers.onError("No response stream from server");
-    return;
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      buffer = buffer.replace(/\r\n/g, "\n");
-
-      let sep = buffer.indexOf("\n\n");
-      while (sep !== -1) {
-        const block = buffer.slice(0, sep);
-        buffer = buffer.slice(sep + 2);
-        if (block.trim()) dispatchSseBlock(block, handlers);
-        sep = buffer.indexOf("\n\n");
+  const collect = (obj: unknown) => {
+    if (!obj || typeof obj !== "object") return;
+    const o = obj as Record<string, unknown>;
+    if (Array.isArray(o.evidence)) {
+      for (const e of o.evidence) add(e as Evidence);
+    }
+    if (o.per_video_summary && typeof o.per_video_summary === "object") {
+      for (const v of Object.values(
+        o.per_video_summary as Record<string, unknown>
+      )) {
+        collect(v);
       }
     }
-
-    if (buffer.trim()) {
-      dispatchSseBlock(buffer, handlers);
+    if (o.notable_moments && Array.isArray(o.notable_moments)) {
+      for (const e of o.notable_moments) add(e as Evidence);
     }
-  } catch {
-    handlers.onError("Stream interrupted");
+  };
+
+  collect(a.comparison);
+  collect(a.virality);
+  collect(a.timeline);
+  if (a.per_video_summary && typeof a.per_video_summary === "object") {
+    for (const v of Object.values(
+      a.per_video_summary as Record<string, unknown>
+    )) {
+      collect(v);
+    }
   }
+
+  return out;
 }
 
 export function formatRate(rate: number | null | undefined): string {

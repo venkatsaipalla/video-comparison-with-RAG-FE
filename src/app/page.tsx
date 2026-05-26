@@ -2,7 +2,8 @@
 
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
-import { createSession } from "@/lib/api";
+import { initSession } from "@/lib/api";
+import { saveSessionBootstrap } from "@/lib/session-store";
 
 export default function HomePage() {
   const router = useRouter();
@@ -16,8 +17,19 @@ export default function HomePage() {
     setError(null);
     setLoading(true);
     try {
-      const { session_id } = await createSession(videoA.trim(), videoB.trim());
-      router.push(`/session/${session_id}`);
+      const videoAUrl = videoA.trim();
+      const videoBUrl = videoB.trim();
+      const data = await initSession(videoAUrl, videoBUrl);
+
+      saveSessionBootstrap({
+        sessionId: data.session_id,
+        videoIds: data.video_ids,
+        titles: data.titles,
+        videoAUrl,
+        videoBUrl,
+      });
+
+      router.push(`/session/${data.session_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -34,9 +46,8 @@ export default function HomePage() {
         Compare two videos with cited AI chat
       </h1>
       <p className="mt-4 text-stone-400">
-        Paste YouTube, YouTube Shorts, TikTok, or Instagram Reel URLs. We ingest
-        transcripts and engagement metrics, then let you ask why one outperformed
-        the other.
+        Paste two video URLs. We ingest them on the GPU pipeline, then you can
+        ask why one outperformed the other.
       </p>
 
       <form onSubmit={onSubmit} className="mt-10 space-y-4">
@@ -72,14 +83,14 @@ export default function HomePage() {
           disabled={loading}
           className="w-full rounded-xl bg-brand-600 py-3 font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
         >
-          {loading ? "Starting analysis…" : "Analyze & compare"}
+          {loading ? "Ingesting videos (1–3 min)…" : "Analyze & compare"}
         </button>
       </form>
 
       <ul className="mt-8 list-inside list-disc text-sm text-stone-500">
         <li>Supports YouTube, Shorts, TikTok, and public Instagram Reels</li>
-        <li>Streaming chat with chunk citations and conversation memory</li>
-        <li>Backend: FastAPI + Supabase pgvector + OpenAI</li>
+        <li>Ingest runs once at upload; chat uses your locked video pair</li>
+        <li>Backend: FastAPI brain + GPU retrieval service</li>
       </ul>
     </main>
   );
