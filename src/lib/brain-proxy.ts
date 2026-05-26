@@ -1,0 +1,48 @@
+import { getApiTimeoutMs, getBrainEndpointUrl } from "@/lib/env";
+
+type BrainEndpoint = "chat" | "init" | "health";
+
+/**
+ * Server-side proxy: browser → `/api/brain/{endpoint}` →
+ * `{NEXT_PUBLIC_API_URL}/{endpoint}` (e.g. `…/chat`).
+ */
+export async function proxyToBrain(
+  req: Request,
+  endpoint: BrainEndpoint
+): Promise<Response> {
+  const url = getBrainEndpointUrl(endpoint);
+  const timeoutMs = getApiTimeoutMs() ?? 120_000;
+  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+
+  try {
+    const res = await fetch(url, {
+      method: req.method,
+      headers: hasBody
+        ? { "Content-Type": "application/json" }
+        : undefined,
+      body: hasBody ? await req.text() : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    const text = await res.text();
+    return new Response(text, {
+      status: res.status,
+      headers: {
+        "Content-Type": res.headers.get("content-type") ?? "application/json",
+      },
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    const timedOut =
+      e instanceof Error &&
+      (e.name === "TimeoutError" || e.name === "AbortError");
+    return Response.json(
+      {
+        detail: timedOut
+          ? `Brain API timed out after ${Math.round(timeoutMs / 1000)}s (${url})`
+          : `Brain API unreachable at ${url}: ${reason}`,
+      },
+      { status: timedOut ? 504 : 502 }
+    );
+  }
+}

@@ -2,11 +2,17 @@
 
 ## Env
 
-`.env.local`:
+Root `.env` (not `.env.local` unless you intentionally override):
 
 ```
 NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
+
+Restart the dev server after changing this. If both `.env` and `.env.local` exist, Next.js prefers `.env.local`.
+
+The browser calls `/api/brain/*` on the Next dev server (same origin). Route handlers in `src/app/api/brain/` proxy server-side to `NEXT_PUBLIC_API_URL` (avoids CORS and gives clearer errors than rewrites).
+
+`NEXT_PUBLIC_API_TIMEOUT_SEC` — client timeout for `/init` and `/chat` (e.g. `120`). `/health` warmup is not limited.
 
 ## API mapping
 

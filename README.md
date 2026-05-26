@@ -13,8 +13,8 @@ Backend repo: `BE-video-comparison-rag` (FastAPI + Supabase pgvector).
 ## Setup
 
 ```bash
-cp .env.example .env.local
-# NEXT_PUBLIC_API_URL=http://localhost:8000
+cp .env.example .env
+# Edit NEXT_PUBLIC_API_URL in .env (brain API URL)
 npm install
 npm run dev
 ```

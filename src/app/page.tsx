@@ -12,8 +12,7 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function onSubmit(e: FormEvent) {
-    e.preventDefault();
+  async function runCompare() {
     setError(null);
     setLoading(true);
     try {
@@ -36,6 +35,11 @@ export default function HomePage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    void runCompare();
   }
 
   return (
@@ -75,9 +79,17 @@ export default function HomePage() {
           />
         </label>
         {error && (
-          <p className="rounded-lg border border-red-800 bg-red-950/40 p-3 text-sm text-red-200">
-            {error}
-          </p>
+          <div className="rounded-lg border border-red-800 bg-red-950/40 p-3 text-sm text-red-200">
+            <p>{error}</p>
+            <button
+              type="button"
+              disabled={loading || !videoA.trim() || !videoB.trim()}
+              onClick={() => void runCompare()}
+              className="mt-3 w-full rounded-lg border border-red-700/80 bg-red-900/30 py-2 text-sm font-medium text-red-100 hover:bg-red-900/50 disabled:opacity-50"
+            >
+              {loading ? "Trying again…" : "Try again with same URLs"}
+            </button>
+          </div>
         )}
         <button
           type="submit"

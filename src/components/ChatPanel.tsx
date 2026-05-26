@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { Citation, citationsFromState, sendChat } from "@/lib/api";
+import { Citation, citationsFromState, sendChat, warmupBrainApi } from "@/lib/api";
 
 type MessageStatus = "complete" | "streaming" | "error";
 
@@ -14,15 +14,62 @@ type Message = {
   status: MessageStatus;
 };
 
-const SUGGESTIONS = [
-  "Why did Video A outperform Video B?",
-  "Compare hooks in the first 5 seconds.",
-  "What should I change in my hook to improve retention?",
-];
+type PromptSuggestion = {
+  id: string;
+  label: string;
+  prompt: string;
+};
+
+function buildSuggestions(
+  titleA: string,
+  titleB: string
+): PromptSuggestion[] {
+  const first =
+    titleA && titleA !== "Video A" ? `the first video (“${titleA}”)` : "the first video";
+  const second =
+    titleB && titleB !== "Video B"
+      ? `the second video (“${titleB}”)`
+      : "the second video";
+
+  return [
+    {
+      id: "winner",
+      label: "Which one did better?",
+      prompt: `Compare both videos for me. Which one did better with people watching (views, likes, comments)? Explain in simple everyday words why you think one worked better than the other.`,
+    },
+    {
+      id: "openings",
+      label: "How do they start?",
+      prompt: `How does ${first} start, and how does ${second} start? Compare the openings in the first few seconds — what is each one trying to do to pull you in?`,
+    },
+    {
+      id: "first-about",
+      label: "What's the first video about?",
+      prompt: `What is ${first} about? Summarize what it says in plain language, like you're explaining it to a friend who hasn't seen it.`,
+    },
+    {
+      id: "second-about",
+      label: "What's the second video about?",
+      prompt: `What is ${second} about? Summarize what it says in plain language, like you're explaining it to a friend who hasn't seen it.`,
+    },
+    {
+      id: "different",
+      label: "How are they different?",
+      prompt: `In simple terms, how are ${first} and ${second} different from each other? Talk about the vibe, how they speak, and what message each one is getting across.`,
+    },
+    {
+      id: "copy",
+      label: "What should I copy?",
+      prompt: `If I'm making my next video and want it to do as well as whichever one performed better, what are 2–3 easy things I should try to copy? Keep it practical and avoid jargon.`,
+    },
+  ];
+}
 
 type Props = {
   sessionId: string;
   videoIds: string[];
+  /** Display names for contextual prompts (defaults to Video A / Video B). */
+  videoLabels?: { a: string; b: string };
   disabled?: boolean;
 };
 
@@ -30,14 +77,28 @@ function newId() {
   return crypto.randomUUID();
 }
 
-export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
+export function ChatPanel({
+  sessionId,
+  videoIds,
+  videoLabels,
+  disabled,
+}: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const labelA = videoLabels?.a?.trim() || "Video A";
+  const labelB = videoLabels?.b?.trim() || "Video B";
+  const suggestions = buildSuggestions(labelA, labelB);
+
+  useEffect(() => {
+    if (disabled) return;
+    void warmupBrainApi();
+  }, [disabled, sessionId]);
+
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, options?: { isRetry?: boolean }) => {
       const trimmed = text.trim();
       if (!trimmed || loading || disabled) return;
 
@@ -45,18 +106,38 @@ export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
       setLoading(true);
       const assistantId = newId();
 
-      setMessages((prev) => [
-        ...prev,
-        { id: newId(), role: "user", content: trimmed, status: "complete" },
-        {
-          id: assistantId,
-          role: "assistant",
-          content: "",
-          citations: [],
-          status: "streaming",
-        },
-      ]);
-      setInput("");
+      if (options?.isRetry) {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          const base =
+            last?.role === "assistant" && last.status === "error"
+              ? prev.slice(0, -1)
+              : prev;
+          return [
+            ...base,
+            {
+              id: assistantId,
+              role: "assistant",
+              content: "",
+              citations: [],
+              status: "streaming",
+            },
+          ];
+        });
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { id: newId(), role: "user", content: trimmed, status: "complete" },
+          {
+            id: assistantId,
+            role: "assistant",
+            content: "",
+            citations: [],
+            status: "streaming",
+          },
+        ]);
+        setInput("");
+      }
 
       try {
         const { answer, state } = await sendChat(sessionId, trimmed);
@@ -91,6 +172,19 @@ export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
     [disabled, loading, sessionId, videoIds]
   );
 
+  const retryLast = useCallback(() => {
+    const last = messages[messages.length - 1];
+    const user = messages[messages.length - 2];
+    if (
+      last?.role !== "assistant" ||
+      last.status !== "error" ||
+      user?.role !== "user"
+    ) {
+      return;
+    }
+    void send(user.content, { isRetry: true });
+  }, [messages, send]);
+
   return (
     <div className="flex h-full min-h-[480px] flex-col rounded-2xl border border-stone-800 bg-stone-900/80">
       <div className="border-b border-stone-800 px-4 py-3">
@@ -100,25 +194,31 @@ export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
         </p>
       </div>
 
-      <div className="flex flex-wrap gap-2 border-b border-stone-800 p-3">
-        {SUGGESTIONS.map((s) => (
-          <button
-            key={s}
-            type="button"
-            disabled={disabled || loading}
-            onClick={() => send(s)}
-            className="rounded-full border border-stone-700 px-3 py-1 text-xs text-stone-300 hover:border-brand-500 hover:text-brand-500 disabled:opacity-40"
-          >
-            {s}
-          </button>
-        ))}
+      <div className="border-b border-stone-800 px-3 py-3">
+        <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-stone-500">
+          Try asking
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {suggestions.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              title={s.prompt}
+              disabled={disabled || loading}
+              onClick={() => send(s.prompt)}
+              className="rounded-lg border border-stone-700 bg-stone-950/60 px-2.5 py-1.5 text-left text-xs text-stone-300 transition-colors hover:border-brand-500/80 hover:bg-brand-950/30 hover:text-brand-400 disabled:opacity-40"
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
         {messages.length === 0 && (
           <p className="text-sm text-stone-500">
-            Ask why one video outperformed another, compare hooks, or get
-            improvement ideas.
+            Tap a question above, or type your own — like comparing how the two
+            videos start, what each one is about, or which one did better.
           </p>
         )}
         {messages.map((msg) => (
@@ -143,7 +243,19 @@ export function ChatPanel({ sessionId, videoIds, disabled }: Props) {
                   </ReactMarkdown>
                 ) : null}
                 {msg.status === "error" && (
-                  <p className="mt-1 text-xs text-red-400">Response failed</p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <p className="text-xs text-red-400">Response failed</p>
+                    {msg.id === messages[messages.length - 1]?.id && (
+                      <button
+                        type="button"
+                        disabled={loading || disabled}
+                        onClick={retryLast}
+                        className="rounded-md border border-stone-600 px-2 py-0.5 text-xs text-stone-300 hover:border-brand-500 hover:text-brand-400 disabled:opacity-40"
+                      >
+                        Try again
+                      </button>
+                    )}
+                  </div>
                 )}
               </>
             ) : (

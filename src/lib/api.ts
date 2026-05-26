@@ -1,6 +1,5 @@
+import { getApiBaseUrl, getApiTimeoutMs } from "@/lib/env";
 import { getUserId } from "@/lib/user";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export type VideoSummary = {
   id: string;
@@ -60,6 +59,25 @@ type Evidence = {
   end_time?: number | null;
 };
 
+async function apiFetch(path: string, init: RequestInit): Promise<Response> {
+  const timeoutMs = getApiTimeoutMs();
+  try {
+    return await fetch(`${getApiBaseUrl()}${path}`, {
+      ...init,
+      signal:
+        timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") {
+      const sec = Math.round((timeoutMs ?? 0) / 1000);
+      throw new Error(
+        `Request timed out after ${sec}s. Increase NEXT_PUBLIC_API_TIMEOUT_SEC in .env if needed.`
+      );
+    }
+    throw e;
+  }
+}
+
 async function parseError(res: Response, fallback: string): Promise<string> {
   const err = await res.json().catch(() => ({}));
   const detail = (err as { detail?: unknown }).detail;
@@ -81,7 +99,7 @@ export async function initSession(
   videoAUrl: string,
   videoBUrl: string
 ): Promise<InitResponse> {
-  const res = await fetch(`${API_URL}/init`, {
+  const res = await apiFetch("/init", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -95,12 +113,21 @@ export async function initSession(
   return res.json();
 }
 
+/** Wake the brain proxy before the first chat (helps cold dev tunnels). */
+export async function warmupBrainApi(): Promise<void> {
+  try {
+    await fetch(`${getApiBaseUrl()}/health`, { method: "GET" });
+  } catch {
+    // Non-fatal; chat will still attempt the real request.
+  }
+}
+
 /** POST /chat — full answer (non-streaming). */
 export async function sendChat(
   sessionId: string,
   message: string
 ): Promise<ChatResponse> {
-  const res = await fetch(`${API_URL}/chat`, {
+  const res = await apiFetch("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
