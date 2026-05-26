@@ -1,4 +1,8 @@
-import type { SessionStatus, VideoSummary } from "@/lib/api";
+import type { SessionStatus } from "@/lib/api";
+import {
+  metadataToVideoSummary,
+  type VideoMetadata,
+} from "@/lib/metadata";
 
 const PREFIX = "cj_session_";
 
@@ -6,6 +10,8 @@ export type SessionBootstrap = {
   sessionId: string;
   videoIds: string[];
   titles: Record<string, string | null>;
+  /** Per video_id metadata from GPU ingest (brain /init response). */
+  metadata: Record<string, VideoMetadata>;
   videoAUrl: string;
   videoBUrl: string;
 };
@@ -20,45 +26,12 @@ export function loadSessionBootstrap(
   const raw = sessionStorage.getItem(PREFIX + sessionId);
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as SessionBootstrap;
+    const parsed = JSON.parse(raw) as SessionBootstrap;
+    if (!parsed.metadata) parsed.metadata = {};
+    return parsed;
   } catch {
     return null;
   }
-}
-
-function videoFromBootstrap(
-  label: "Video A" | "Video B",
-  videoId: string,
-  url: string,
-  title: string | null
-): VideoSummary {
-  return {
-    id: videoId,
-    platform: guessPlatform(url),
-    url,
-    title,
-    creator: null,
-    thumbnail_url: null,
-    duration_sec: null,
-    views: null,
-    likes: null,
-    comments: null,
-    engagement: {},
-    ingest_status: "ready",
-    ingest_error: null,
-  };
-}
-
-function guessPlatform(url: string): string {
-  try {
-    const h = new URL(url).hostname.replace("www.", "");
-    if (h.includes("youtube") || h.includes("youtu.be")) return "youtube";
-    if (h.includes("tiktok")) return "tiktok";
-    if (h.includes("instagram")) return "instagram";
-  } catch {
-    /* ignore */
-  }
-  return "unknown";
 }
 
 /** Build FE session view from data saved at /init time. */
@@ -66,20 +39,22 @@ export function bootstrapToSessionStatus(
   bootstrap: SessionBootstrap
 ): SessionStatus {
   const [idA, idB] = bootstrap.videoIds;
+  const meta = bootstrap.metadata ?? {};
+
   return {
     id: bootstrap.sessionId,
     status: "ready",
     error_message: null,
-    video_a: videoFromBootstrap(
-      "Video A",
+    video_a: metadataToVideoSummary(
       idA,
       bootstrap.videoAUrl,
+      meta[idA],
       bootstrap.titles[idA] ?? null
     ),
-    video_b: videoFromBootstrap(
-      "Video B",
+    video_b: metadataToVideoSummary(
       idB,
       bootstrap.videoBUrl,
+      meta[idB],
       bootstrap.titles[idB] ?? null
     ),
   };

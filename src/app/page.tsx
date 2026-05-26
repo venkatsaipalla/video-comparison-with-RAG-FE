@@ -25,6 +25,7 @@ export default function HomePage() {
         sessionId: data.session_id,
         videoIds: data.video_ids,
         titles: data.titles,
+        metadata: data.metadata ?? {},
         videoAUrl,
         videoBUrl,
       });

@@ -34,6 +34,8 @@ export type InitResponse = {
   session_id: string;
   video_ids: string[];
   titles: Record<string, string | null>;
+  /** GPU ingest metadata keyed by video_id (views, channel, duration, …). */
+  metadata: Record<string, Record<string, unknown>>;
 };
 
 export type ChatResponse = {
