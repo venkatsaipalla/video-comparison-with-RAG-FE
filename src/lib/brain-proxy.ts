@@ -2,6 +2,15 @@ import { getApiTimeoutMs, getBrainEndpointUrl } from "@/lib/env";
 
 type BrainEndpoint = "chat" | "init" | "health";
 
+/** Server-only — same value as Render `BACKEND_API_KEY`. Never use NEXT_PUBLIC_. */
+function brainRequestHeaders(hasBody: boolean): HeadersInit {
+  const headers: Record<string, string> = {};
+  if (hasBody) headers["Content-Type"] = "application/json";
+  const apiKey = process.env.BRAIN_API_KEY?.trim();
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  return headers;
+}
+
 /**
  * Server-side proxy: browser → `/api/brain/{endpoint}` →
  * `{NEXT_PUBLIC_API_URL}/{endpoint}` (e.g. `…/chat`).
@@ -17,9 +26,7 @@ export async function proxyToBrain(
   try {
     const res = await fetch(url, {
       method: req.method,
-      headers: hasBody
-        ? { "Content-Type": "application/json" }
-        : undefined,
+      headers: brainRequestHeaders(hasBody),
       body: hasBody ? await req.text() : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
