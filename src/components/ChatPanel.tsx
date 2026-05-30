@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Citation, citationsFromState, sendChat, warmupBrainApi } from "@/lib/api";
+import { notifyComparisonUpdated } from "@/lib/comparison-events";
+import { ChatMessagesSkeleton, Spinner } from "@/components/loaders";
 
 type MessageStatus = "complete" | "streaming" | "error";
 
-type Message = {
+export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
@@ -66,10 +68,18 @@ function buildSuggestions(
 }
 
 type Props = {
+  userId: string;
   sessionId: string;
   videoIds: string[];
   /** Display names for contextual prompts (defaults to Video A / Video B). */
   videoLabels?: { a: string; b: string };
+  initialMessages?: ChatMessage[];
+  /** Called after backend saves the turn (reload history from API). */
+  onConversationSaved?: () => void | Promise<void>;
+  /** Initial load from API — skeleton in message area only. */
+  loadingHistory?: boolean;
+  /** Background sync after save — keeps messages visible. */
+  syncingHistory?: boolean;
   disabled?: boolean;
 };
 
@@ -78,12 +88,17 @@ function newId() {
 }
 
 export function ChatPanel({
+  userId,
   sessionId,
   videoIds,
   videoLabels,
+  initialMessages = [],
+  onConversationSaved,
+  loadingHistory = false,
+  syncingHistory = false,
   disabled,
 }: Props) {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +106,10 @@ export function ChatPanel({
   const labelA = videoLabels?.a?.trim() || "Video A";
   const labelB = videoLabels?.b?.trim() || "Video B";
   const suggestions = buildSuggestions(labelA, labelB);
+
+  useEffect(() => {
+    setMessages(initialMessages);
+  }, [initialMessages]);
 
   useEffect(() => {
     if (disabled) return;
@@ -140,7 +159,7 @@ export function ChatPanel({
       }
 
       try {
-        const { answer, state } = await sendChat(sessionId, trimmed);
+        const { answer, state } = await sendChat(userId, sessionId, trimmed);
         const citations = citationsFromState(state, videoIds);
 
         setMessages((prev) =>
@@ -155,6 +174,8 @@ export function ChatPanel({
               : m
           )
         );
+        notifyComparisonUpdated(sessionId);
+        await onConversationSaved?.();
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Chat failed";
         setError(msg);
@@ -169,7 +190,7 @@ export function ChatPanel({
         setLoading(false);
       }
     },
-    [disabled, loading, sessionId, videoIds]
+    [disabled, loading, onConversationSaved, sessionId, userId, videoIds]
   );
 
   const retryLast = useCallback(() => {
@@ -188,10 +209,20 @@ export function ChatPanel({
   return (
     <div className="flex h-full min-h-[480px] flex-col rounded-2xl border border-stone-800 bg-stone-900/80">
       <div className="border-b border-stone-800 px-4 py-3">
-        <h2 className="font-semibold text-stone-100">AI comparison chat</h2>
-        <p className="text-xs text-stone-500">
-          Answers grounded in retrieved transcript evidence
-        </p>
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="font-semibold text-stone-100">AI comparison chat</h2>
+            <p className="text-xs text-stone-500">
+              Answers grounded in retrieved transcript evidence
+            </p>
+          </div>
+          {syncingHistory && (
+            <span className="flex shrink-0 items-center gap-1.5 text-xs text-stone-500">
+              <Spinner size="sm" />
+              Saving
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="border-b border-stone-800 px-3 py-3">
@@ -215,13 +246,17 @@ export function ChatPanel({
       </div>
 
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
-        {messages.length === 0 && (
-          <p className="text-sm text-stone-500">
-            Tap a question above, or type your own — like comparing how the two
-            videos start, what each one is about, or which one did better.
-          </p>
-        )}
-        {messages.map((msg) => (
+        {loadingHistory ? (
+          <ChatMessagesSkeleton />
+        ) : (
+          <>
+            {messages.length === 0 && (
+              <p className="text-sm text-stone-500">
+                Tap a question above, or type your own — like comparing how the two
+                videos start, what each one is about, or which one did better.
+              </p>
+            )}
+            {messages.map((msg) => (
           <div
             key={msg.id}
             className={
@@ -234,7 +269,7 @@ export function ChatPanel({
               <>
                 {msg.status === "streaming" && !msg.content ? (
                   <div className="flex items-center gap-2 text-stone-400">
-                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-brand-500" />
+                    <Spinner size="sm" />
                     <span>Thinking…</span>
                   </div>
                 ) : msg.content ? (
@@ -286,7 +321,9 @@ export function ChatPanel({
             )}
           </div>
         ))}
-        {error && <p className="text-sm text-red-400">{error}</p>}
+            {error && <p className="text-sm text-red-400">{error}</p>}
+          </>
+        )}
       </div>
 
       <form

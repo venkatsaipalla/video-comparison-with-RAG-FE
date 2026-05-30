@@ -1,5 +1,6 @@
 import { getApiBaseUrl, getApiTimeoutMs } from "@/lib/env";
-import { getUserId } from "@/lib/user";
+import type { VideoMetadata } from "@/lib/metadata";
+import { metadataToVideoSummary } from "@/lib/metadata";
 
 export type VideoSummary = {
   id: string;
@@ -33,7 +34,6 @@ export type InitResponse = {
   session_id: string;
   video_ids: string[];
   titles: Record<string, string | null>;
-  /** GPU ingest metadata keyed by video_id (views, channel, duration, …). */
   metadata: Record<string, Record<string, unknown>>;
 };
 
@@ -50,6 +50,78 @@ export type Citation = {
   start_sec: number | null;
   end_sec: number | null;
   excerpt: string;
+};
+
+export type ComparisonListItem = {
+  id: string;
+  title: string | null;
+  video_a_url: string;
+  video_b_url: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type StoredMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  citations: Citation[];
+  created_at: string;
+};
+
+/** Chat row restored from Postgres (matches ChatPanel message shape). */
+export type PersistedChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  citations?: Citation[];
+  status: "complete";
+};
+
+/** Map persisted API messages → chat UI rows. */
+export function storedMessagesToChat(
+  messages: StoredMessage[]
+): PersistedChatMessage[] {
+  return messages.map((m) => ({
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    citations: normalizeCitations(m.citations),
+    status: "complete" as const,
+  }));
+}
+
+function normalizeCitations(raw: unknown): Citation[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: Citation[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const c = item as Record<string, unknown>;
+    const excerpt = String(c.excerpt ?? c.quote ?? "");
+    if (!excerpt) continue;
+    out.push({
+      chunk_id: String(c.chunk_id ?? `${c.video_id}:${c.start_sec}:${excerpt.slice(0, 40)}`),
+      video_label: String(c.video_label ?? "Video"),
+      video_id: String(c.video_id ?? ""),
+      start_sec: typeof c.start_sec === "number" ? c.start_sec : null,
+      end_sec: typeof c.end_sec === "number" ? c.end_sec : null,
+      excerpt: excerpt.slice(0, 400),
+    });
+  }
+  return out.length ? out : undefined;
+}
+
+export type ComparisonDetail = {
+  id: string;
+  title: string | null;
+  video_a_url: string;
+  video_b_url: string;
+  video_ids: string[];
+  titles: Record<string, string | null>;
+  metadata: Record<string, VideoMetadata>;
+  status: string;
+  messages: StoredMessage[];
 };
 
 type Evidence = {
@@ -91,11 +163,66 @@ async function parseError(res: Response, fallback: string): Promise<string> {
   return fallback;
 }
 
+export async function listComparisons(
+  userId: string
+): Promise<ComparisonListItem[]> {
+  const res = await apiFetch(`/users/${userId}/comparisons`, { method: "GET" });
+  if (!res.ok) {
+    throw new Error(await parseError(res, "Failed to load history"));
+  }
+  return res.json();
+}
+
+export async function getComparison(
+  userId: string,
+  comparisonId: string
+): Promise<ComparisonDetail> {
+  const res = await apiFetch(
+    `/comparisons/${comparisonId}?user_id=${encodeURIComponent(userId)}`,
+    { method: "GET" }
+  );
+  if (!res.ok) {
+    throw new Error(await parseError(res, "Comparison not found"));
+  }
+  return res.json();
+}
+
+/** Build FE session view from persisted comparison row. */
+export function comparisonToSessionStatus(
+  detail: ComparisonDetail
+): SessionStatus {
+  const [idA, idB] = detail.video_ids;
+  const meta = detail.metadata ?? {};
+
+  return {
+    id: detail.id,
+    status: detail.status,
+    error_message: null,
+    video_a: idA
+      ? metadataToVideoSummary(
+          idA,
+          detail.video_a_url,
+          meta[idA],
+          detail.titles[idA] ?? null
+        )
+      : null,
+    video_b: idB
+      ? metadataToVideoSummary(
+          idB,
+          detail.video_b_url,
+          meta[idB],
+          detail.titles[idB] ?? null
+        )
+      : null,
+  };
+}
+
 /**
- * POST /init — ingest both URLs on GPU, create ADK session, return session_id.
+ * POST /init — ingest both URLs on GPU, create comparison + ADK session.
  * Can take 1–3+ minutes while the retrieval service ingests.
  */
 export async function initSession(
+  userId: string,
   videoAUrl: string,
   videoBUrl: string
 ): Promise<InitResponse> {
@@ -103,7 +230,7 @@ export async function initSession(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      user_id: getUserId(),
+      user_id: userId,
       urls: [videoAUrl.trim(), videoBUrl.trim()],
     }),
   });
@@ -124,6 +251,7 @@ export async function warmupBrainApi(): Promise<void> {
 
 /** POST /chat — full answer (non-streaming). */
 export async function sendChat(
+  userId: string,
   sessionId: string,
   message: string
 ): Promise<ChatResponse> {
@@ -131,7 +259,7 @@ export async function sendChat(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      user_id: getUserId(),
+      user_id: userId,
       session_id: sessionId,
       message,
     }),

@@ -3,33 +3,29 @@
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
 import { initSession } from "@/lib/api";
-import { saveSessionBootstrap } from "@/lib/session-store";
+import { useBackendUserId } from "@/hooks/useBackendUser";
+import { InlineProgress } from "@/components/loaders";
 
 export default function HomePage() {
   const router = useRouter();
+  const userId = useBackendUserId();
   const [videoA, setVideoA] = useState("");
   const [videoB, setVideoB] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function runCompare() {
+    if (!userId) {
+      setError("Sign-in is still loading. Try again in a moment.");
+      return;
+    }
     setError(null);
     setLoading(true);
     try {
       const videoAUrl = videoA.trim();
       const videoBUrl = videoB.trim();
-      const data = await initSession(videoAUrl, videoBUrl);
-
-      saveSessionBootstrap({
-        sessionId: data.session_id,
-        videoIds: data.video_ids,
-        titles: data.titles,
-        metadata: data.metadata ?? {},
-        videoAUrl,
-        videoBUrl,
-      });
-
-      router.push(`/session/${data.session_id}`);
+      const data = await initSession(userId, videoAUrl, videoBUrl);
+      router.push(`/c/${data.session_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -93,17 +89,23 @@ export default function HomePage() {
         )}
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || !userId}
           className="w-full rounded-xl bg-brand-600 py-3 font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
         >
-          {loading ? "Ingesting videos (1–3 min)…" : "Analyze & compare"}
+          {loading ? "Starting analysis…" : "Analyze & compare"}
         </button>
+        {loading && (
+          <InlineProgress
+            label="Ingesting both videos"
+            detail="This usually takes 1–3 minutes. You can keep browsing the sidebar."
+          />
+        )}
       </form>
 
       <ul className="mt-8 list-inside list-disc text-sm text-stone-500">
         <li>Supports YouTube, Shorts, TikTok, and public Instagram Reels</li>
         <li>Ingest runs once at upload; chat uses your locked video pair</li>
-        <li>Backend: FastAPI brain + GPU retrieval service</li>
+        <li>Comparisons are saved to your account in the sidebar</li>
       </ul>
     </main>
   );

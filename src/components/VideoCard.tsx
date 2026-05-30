@@ -1,11 +1,17 @@
 import { VideoSummary, embedUrl, formatRate } from "@/lib/api";
+import { VideoCardSkeleton } from "@/components/loaders";
 
 type Props = {
   label: string;
   video: VideoSummary | null;
+  loading?: boolean;
 };
 
-export function VideoCard({ label, video }: Props) {
+export function VideoCard({ label, video, loading }: Props) {
+  if (loading) {
+    return <VideoCardSkeleton label={label} />;
+  }
+
   if (!video) {
     return (
       <Card label={label}>

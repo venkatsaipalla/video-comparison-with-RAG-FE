@@ -1,8 +1,6 @@
-import { getApiTimeoutMs, getBrainEndpointUrl } from "@/lib/env";
+import { getApiTimeoutMs, getBackendApiUrl } from "@/lib/env";
 
-type BrainEndpoint = "chat" | "init" | "health";
-
-/** Server-only — same value as Render `BACKEND_API_KEY`. Never use NEXT_PUBLIC_. */
+/** Server-only — same value as Render `BACKEND_API_KEY`. */
 function brainRequestHeaders(hasBody: boolean): HeadersInit {
   const headers: Record<string, string> = {};
   if (hasBody) headers["Content-Type"] = "application/json";
@@ -12,22 +10,24 @@ function brainRequestHeaders(hasBody: boolean): HeadersInit {
 }
 
 /**
- * Server-side proxy: browser → `/api/brain/{endpoint}` →
- * `{NEXT_PUBLIC_API_URL}/{endpoint}` (e.g. `…/chat`).
+ * Proxy any brain path: `/api/brain/foo` → `{NEXT_PUBLIC_API_URL}/foo`
+ * `brainPath` may include query string.
  */
-export async function proxyToBrain(
-  req: Request,
-  endpoint: BrainEndpoint
+export async function proxyToBrainUrl(
+  method: string,
+  brainPath: string,
+  body?: string
 ): Promise<Response> {
-  const url = getBrainEndpointUrl(endpoint);
+  const base = getBackendApiUrl();
+  const url = `${base}/${brainPath.replace(/^\//, "")}`;
   const timeoutMs = getApiTimeoutMs() ?? 120_000;
-  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+  const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
 
   try {
     const res = await fetch(url, {
-      method: req.method,
+      method,
       headers: brainRequestHeaders(hasBody),
-      body: hasBody ? await req.text() : undefined,
+      body: hasBody ? body : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
 
