@@ -70,7 +70,7 @@ export default function HomePage() {
             type="url"
             value={videoB}
             onChange={(e) => setVideoB(e.target.value)}
-            placeholder="https://www.tiktok.com/@user/video/..."
+            placeholder="https://www.youtube.com/shorts/..."
             className="mt-1 w-full rounded-xl border border-stone-700 bg-stone-900 px-4 py-3 text-stone-100 outline-none focus:border-brand-500"
           />
         </label>
@@ -103,7 +103,7 @@ export default function HomePage() {
       </form>
 
       <ul className="mt-8 list-inside list-disc text-sm text-stone-500">
-        <li>Supports YouTube, Shorts, TikTok, and public Instagram Reels</li>
+        <li>Supports YouTube videos and YouTube Shorts (TikTok and Instagram Reels coming soon)</li>
         <li>Ingest runs once at upload; chat uses your locked video pair</li>
         <li>Comparisons are saved to your account in the sidebar</li>
       </ul>
