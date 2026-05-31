@@ -1,11 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listComparisons, type ComparisonListItem } from "@/lib/api";
-import { COMPARISON_UPDATED } from "@/lib/comparison-events";
+import {
+  deleteComparison,
+  listComparisons,
+  type ComparisonListItem,
+} from "@/lib/api";
+import {
+  COMPARISON_DELETED,
+  COMPARISON_UPDATED,
+} from "@/lib/comparison-events";
 import {
   SidebarHistorySkeleton,
   Spinner,
@@ -44,12 +51,14 @@ function formatWhen(iso: string): string {
 
 export function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
   const { data: session } = useSession();
   const userId = useBackendUserId();
   const [items, setItems] = useState<ComparisonListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const hasLoadedRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -71,13 +80,46 @@ export function Sidebar() {
 
   useEffect(() => {
     void refresh();
-  }, [refresh, pathname]);
+  }, [refresh]);
 
   useEffect(() => {
     const onUpdate = () => void refresh();
+    const onDeleted = (event: Event) => {
+      const id = (event as CustomEvent<{ comparisonId: string }>).detail
+        ?.comparisonId;
+      if (id) {
+        setItems((prev) => prev.filter((item) => item.id !== id));
+      }
+      void refresh();
+    };
     window.addEventListener(COMPARISON_UPDATED, onUpdate);
-    return () => window.removeEventListener(COMPARISON_UPDATED, onUpdate);
+    window.addEventListener(COMPARISON_DELETED, onDeleted);
+    return () => {
+      window.removeEventListener(COMPARISON_UPDATED, onUpdate);
+      window.removeEventListener(COMPARISON_DELETED, onDeleted);
+    };
   }, [refresh]);
+
+  async function handleDelete(item: ComparisonListItem) {
+    if (!userId || deletingId) return;
+    const ok = window.confirm(
+      `Delete "${comparisonLabel(item)}" and all its messages? This cannot be undone.`
+    );
+    if (!ok) return;
+
+    setDeletingId(item.id);
+    try {
+      await deleteComparison(userId, item.id);
+      setItems((prev) => prev.filter((row) => row.id !== item.id));
+      if (pathname === `/c/${item.id}`) {
+        router.push("/");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not delete");
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-stone-800 bg-stone-950/80">
@@ -123,26 +165,47 @@ export function Sidebar() {
         {!loading && (
           <ul className="space-y-0.5">
             {items.map((item) => {
-            const href = `/c/${item.id}`;
-            const active = pathname === href;
-            return (
-              <li key={item.id}>
-                <Link
-                  href={href}
-                  className={`block rounded-lg px-2 py-2 text-sm transition-colors ${
-                    active
-                      ? "bg-stone-800 text-stone-100"
-                      : "text-stone-400 hover:bg-stone-900 hover:text-stone-200"
-                  }`}
-                >
-                  <span className="line-clamp-2">{comparisonLabel(item)}</span>
-                  <span className="mt-0.5 block text-[10px] text-stone-600">
-                    {formatWhen(item.updated_at)}
-                  </span>
-                </Link>
-              </li>
-            );
-          })}
+              const href = `/c/${item.id}`;
+              const active = pathname === href;
+              const isDeleting = deletingId === item.id;
+              return (
+                <li key={item.id} className="group relative">
+                  <Link
+                    href={href}
+                    className={`block rounded-lg px-2 py-2 pr-8 text-sm transition-colors ${
+                      active
+                        ? "bg-stone-800 text-stone-100"
+                        : "text-stone-400 hover:bg-stone-900 hover:text-stone-200"
+                    } ${isDeleting ? "opacity-50" : ""}`}
+                  >
+                    <span className="line-clamp-2">{comparisonLabel(item)}</span>
+                    <span className="mt-0.5 block text-[10px] text-stone-600">
+                      {formatWhen(item.updated_at)}
+                    </span>
+                  </Link>
+                  <button
+                    type="button"
+                    title="Delete comparison"
+                    disabled={isDeleting}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      void handleDelete(item);
+                    }}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-stone-600 opacity-0 transition-opacity hover:bg-red-950/50 hover:text-red-400 group-hover:opacity-100 disabled:opacity-40"
+                    aria-label={`Delete ${comparisonLabel(item)}`}
+                  >
+                    {isDeleting ? (
+                      <Spinner size="sm" />
+                    ) : (
+                      <span aria-hidden className="text-sm leading-none">
+                        ×
+                      </span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

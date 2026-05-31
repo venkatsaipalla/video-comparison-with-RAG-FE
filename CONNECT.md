@@ -6,11 +6,13 @@ Root `.env` (not `.env.local` unless you intentionally override):
 
 ```
 NEXT_PUBLIC_API_URL=http://localhost:8000
+BACKEND_API_URL=http://localhost:8000
+BRAIN_API_KEY=<same as brain BACKEND_API_KEY>
 ```
 
-Restart the dev server after changing this. If both `.env` and `.env.local` exist, Next.js prefers `.env.local`.
+**Chat** uses a dedicated same-origin route `POST /api/chat` (not the catch-all `/api/brain/*`). Next.js forwards server-side to `BACKEND_API_URL`. History, init, and comparisons use `/api/brain/*`.
 
-The browser calls `/api/brain/*` on the Next dev server (same origin). Route handlers in `src/app/api/brain/` proxy server-side to `NEXT_PUBLIC_API_URL` (avoids CORS and gives clearer errors than rewrites).
+Restart the dev server after changing `.env`.
 
 `NEXT_PUBLIC_API_TIMEOUT_SEC` — client timeout for `/init` and `/chat` (e.g. `120`). `/health` warmup is not limited.
 
@@ -19,7 +21,7 @@ The browser calls `/api/brain/*` on the Next dev server (same origin). Route han
 | UI action | Brain endpoint | Notes |
 |-----------|----------------|--------|
 | Analyze & compare | `POST /init` | `{ user_id, urls: [urlA, urlB] }` — blocks until GPU ingest finishes |
-| Chat send | `POST /chat` | `{ user_id, session_id, message }` → `{ answer, state }` |
+| Chat send | `POST /api/chat` → `BACKEND_API_URL/chat` | Dedicated route (not `/api/brain/*`) |
 | Health | `GET /health` | — |
 
 `user_id` is a stable UUID in `localStorage` (`src/lib/user.ts`).

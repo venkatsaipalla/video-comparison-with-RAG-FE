@@ -1,4 +1,4 @@
-import { getApiTimeoutMs, getBackendApiUrl } from "@/lib/env";
+import { getServerBackendApiUrl, getServerProxyTimeoutMs } from "@/lib/env";
 
 /** Server-only — same value as Render `BACKEND_API_KEY`. */
 function brainRequestHeaders(hasBody: boolean): HeadersInit {
@@ -16,11 +16,12 @@ function brainRequestHeaders(hasBody: boolean): HeadersInit {
 export async function proxyToBrainUrl(
   method: string,
   brainPath: string,
-  body?: string
+  body?: string,
+  timeoutMs?: number
 ): Promise<Response> {
-  const base = getBackendApiUrl();
+  const base = getServerBackendApiUrl();
   const url = `${base}/${brainPath.replace(/^\//, "")}`;
-  const timeoutMs = getApiTimeoutMs() ?? 120_000;
+  const limit = timeoutMs ?? getServerProxyTimeoutMs();
   const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
 
   try {
@@ -28,11 +29,12 @@ export async function proxyToBrainUrl(
       method,
       headers: brainRequestHeaders(hasBody),
       body: hasBody ? body : undefined,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(limit),
+      cache: "no-store",
     });
 
-    const text = await res.text();
-    return new Response(text, {
+    // Stream through — do not buffer the full body before forwarding.
+    return new Response(res.body, {
       status: res.status,
       headers: {
         "Content-Type": res.headers.get("content-type") ?? "application/json",
@@ -46,7 +48,7 @@ export async function proxyToBrainUrl(
     return Response.json(
       {
         detail: timedOut
-          ? `Brain API timed out after ${Math.round(timeoutMs / 1000)}s (${url})`
+          ? `Brain API timed out after ${Math.round(limit / 1000)}s (${url})`
           : `Brain API unreachable at ${url}: ${reason}`,
       },
       { status: timedOut ? 504 : 502 }

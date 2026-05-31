@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Citation, citationsFromState, sendChat, warmupBrainApi } from "@/lib/api";
 import { notifyComparisonUpdated } from "@/lib/comparison-events";
 import { ChatMessagesSkeleton, Spinner } from "@/components/loaders";
+import { SourcesAccordion } from "@/components/SourcesAccordion";
+import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 
 type MessageStatus = "complete" | "streaming" | "error";
 
@@ -87,6 +89,8 @@ function newId() {
   return crypto.randomUUID();
 }
 
+let brainWarmed = false;
+
 export function ChatPanel({
   userId,
   sessionId,
@@ -102,19 +106,57 @@ export function ChatPanel({
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dictationBaseRef = useRef("");
 
   const labelA = videoLabels?.a?.trim() || "Video A";
   const labelB = videoLabels?.b?.trim() || "Video B";
   const suggestions = buildSuggestions(labelA, labelB);
 
-  useEffect(() => {
-    setMessages(initialMessages);
-  }, [initialMessages]);
+  const handleTranscript = useCallback((text: string, isFinal: boolean) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    if (isFinal) {
+      const base = dictationBaseRef.current;
+      const spacer = base && !base.endsWith(" ") ? " " : "";
+      dictationBaseRef.current = `${base}${spacer}${trimmed}`.trimStart();
+      setInput(dictationBaseRef.current);
+    } else {
+      const base = dictationBaseRef.current;
+      const spacer = base && !base.endsWith(" ") ? " " : "";
+      setInput(`${base}${spacer}${trimmed}`.trimStart());
+    }
+  }, []);
+
+  const {
+    supported: speechSupported,
+    listening,
+    error: speechError,
+    toggle: toggleDictation,
+    stop: stopDictation,
+  } = useSpeechRecognition({
+    enabled: !disabled && !loading,
+    onTranscript: handleTranscript,
+  });
 
   useEffect(() => {
-    if (disabled) return;
+    setMessages(initialMessages);
+    setInput("");
+    setError(null);
+    setLoading(false);
+    dictationBaseRef.current = "";
+    stopDictation();
+  }, [sessionId, initialMessages, stopDictation]);
+
+  useEffect(() => {
+    if (disabled || loading) stopDictation();
+  }, [disabled, loading, stopDictation]);
+
+  useEffect(() => {
+    if (disabled || brainWarmed) return;
+    brainWarmed = true;
     void warmupBrainApi();
-  }, [disabled, sessionId]);
+  }, [disabled]);
 
   const send = useCallback(
     async (text: string, options?: { isRetry?: boolean }) => {
@@ -123,6 +165,7 @@ export function ChatPanel({
 
       setError(null);
       setLoading(true);
+      stopDictation();
       const assistantId = newId();
 
       if (options?.isRetry) {
@@ -190,8 +233,16 @@ export function ChatPanel({
         setLoading(false);
       }
     },
-    [disabled, loading, onConversationSaved, sessionId, userId, videoIds]
+    [disabled, loading, onConversationSaved, sessionId, stopDictation, userId, videoIds]
   );
+
+  function handleMicClick() {
+    if (disabled || loading) return;
+    if (!listening) {
+      dictationBaseRef.current = input.trim() ? `${input.trim()} ` : "";
+    }
+    toggleDictation();
+  }
 
   const retryLast = useCallback(() => {
     const last = messages[messages.length - 1];
@@ -297,27 +348,7 @@ export function ChatPanel({
               msg.content
             )}
             {msg.citations && msg.citations.length > 0 && (
-              <div className="mt-3 space-y-2 border-t border-stone-700 pt-2">
-                <p className="text-xs font-medium text-stone-400">Sources</p>
-                {msg.citations.map((c) => (
-                  <div
-                    key={c.chunk_id}
-                    className="rounded border border-stone-700 bg-stone-950/50 p-2 text-xs"
-                  >
-                    <span className="font-medium text-brand-500">
-                      {c.video_label}
-                    </span>
-                    {c.start_sec != null && (
-                      <span className="text-stone-500">
-                        {" "}
-                        · {formatTs(c.start_sec)}
-                        {c.end_sec != null && `–${formatTs(c.end_sec)}`}
-                      </span>
-                    )}
-                    <p className="mt-1 text-stone-400">{c.excerpt}</p>
-                  </div>
-                ))}
-              </div>
+              <SourcesAccordion citations={msg.citations} />
             )}
           </div>
         ))}
@@ -333,16 +364,50 @@ export function ChatPanel({
           send(input);
         }}
       >
+        {(speechError || (listening && speechSupported)) && (
+          <p
+            className={`mb-2 text-xs ${speechError ? "text-red-400" : "text-brand-400"}`}
+          >
+            {speechError ??
+              "Listening… speak your question (stops when you pause)."}
+          </p>
+        )}
         <div className="flex gap-2">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={
-              disabled ? "Session unavailable" : "Ask about these videos…"
-            }
-            disabled={disabled || loading}
-            className="flex-1 rounded-lg border border-stone-700 bg-stone-950 px-3 py-2 text-sm outline-none focus:border-brand-500"
-          />
+          <div className="relative min-w-0 flex-1">
+            <input
+              value={input}
+              onChange={(e) => {
+                setInput(e.target.value);
+                dictationBaseRef.current = e.target.value;
+              }}
+              placeholder={
+                disabled
+                  ? "Session unavailable"
+                  : listening
+                    ? "Listening…"
+                    : "Ask about these videos…"
+              }
+              disabled={disabled || loading}
+              className="w-full rounded-lg border border-stone-700 bg-stone-950 py-2 pl-3 pr-10 text-sm outline-none focus:border-brand-500"
+            />
+            {speechSupported && (
+              <button
+                type="button"
+                title={listening ? "Stop listening" : "Transcribe with voice"}
+                aria-label={listening ? "Stop listening" : "Start voice transcription"}
+                aria-pressed={listening}
+                disabled={disabled || loading}
+                onClick={handleMicClick}
+                className={`absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md transition-colors disabled:opacity-40 ${
+                  listening
+                    ? "bg-red-950/60 text-red-400 hover:bg-red-900/60"
+                    : "text-stone-500 hover:bg-stone-800 hover:text-stone-300"
+                }`}
+              >
+                <MicIcon listening={listening} />
+              </button>
+            )}
+          </div>
           <button
             type="submit"
             disabled={disabled || loading || !input.trim()}
@@ -356,8 +421,22 @@ export function ChatPanel({
   );
 }
 
-function formatTs(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
+function MicIcon({ listening }: { listening: boolean }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`h-4 w-4 ${listening ? "animate-pulse" : ""}`}
+      aria-hidden
+    >
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" x2="12" y1="19" y2="22" />
+    </svg>
+  );
 }

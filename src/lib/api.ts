@@ -1,4 +1,4 @@
-import { getApiBaseUrl, getApiTimeoutMs } from "@/lib/env";
+import { getApiBaseUrl, getApiTimeoutMs, getClientChatTimeoutMs } from "@/lib/env";
 import type { VideoMetadata } from "@/lib/metadata";
 import { metadataToVideoSummary } from "@/lib/metadata";
 
@@ -50,6 +50,8 @@ export type Citation = {
   start_sec: number | null;
   end_sec: number | null;
   excerpt: string;
+  /** Cross-encoder rerank score from retrieval (higher = more relevant). */
+  rerank_score?: number | null;
 };
 
 export type ComparisonListItem = {
@@ -107,6 +109,8 @@ function normalizeCitations(raw: unknown): Citation[] | undefined {
       start_sec: typeof c.start_sec === "number" ? c.start_sec : null,
       end_sec: typeof c.end_sec === "number" ? c.end_sec : null,
       excerpt: excerpt.slice(0, 400),
+      rerank_score:
+        typeof c.rerank_score === "number" ? c.rerank_score : null,
     });
   }
   return out.length ? out : undefined;
@@ -133,13 +137,20 @@ type Evidence = {
 
 async function apiFetch(path: string, init: RequestInit): Promise<Response> {
   const timeoutMs = getApiTimeoutMs();
+  const signal =
+    init.signal ??
+    (timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined);
+
   try {
     return await fetch(`${getApiBaseUrl()}${path}`, {
       ...init,
-      signal:
-        timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined,
+      signal,
+      cache: "no-store",
     });
   } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw e;
+    }
     if (e instanceof Error && e.name === "TimeoutError") {
       const sec = Math.round((timeoutMs ?? 0) / 1000);
       throw new Error(
@@ -148,6 +159,21 @@ async function apiFetch(path: string, init: RequestInit): Promise<Response> {
     }
     throw e;
   }
+}
+
+/**
+ * Same-origin POST /chat — Next.js forwards to `BACKEND_API_URL` server-side.
+ * Avoids browser → dev-tunnel CORS/auth issues and the catch-all brain proxy.
+ */
+async function chatFetch(body: string, signal?: AbortSignal): Promise<Response> {
+  const timeoutMs = getClientChatTimeoutMs();
+  return fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    signal: signal ?? AbortSignal.timeout(timeoutMs),
+    cache: "no-store",
+  });
 }
 
 async function parseError(res: Response, fallback: string): Promise<string> {
@@ -175,16 +201,30 @@ export async function listComparisons(
 
 export async function getComparison(
   userId: string,
-  comparisonId: string
+  comparisonId: string,
+  signal?: AbortSignal
 ): Promise<ComparisonDetail> {
   const res = await apiFetch(
     `/comparisons/${comparisonId}?user_id=${encodeURIComponent(userId)}`,
-    { method: "GET" }
+    { method: "GET", signal }
   );
   if (!res.ok) {
     throw new Error(await parseError(res, "Comparison not found"));
   }
   return res.json();
+}
+
+export async function deleteComparison(
+  userId: string,
+  comparisonId: string
+): Promise<void> {
+  const res = await apiFetch(
+    `/comparisons/${comparisonId}?user_id=${encodeURIComponent(userId)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) {
+    throw new Error(await parseError(res, "Could not delete comparison"));
+  }
 }
 
 /** Build FE session view from persisted comparison row. */
@@ -240,30 +280,42 @@ export async function initSession(
   return res.json();
 }
 
-/** Wake the brain proxy before the first chat (helps cold dev tunnels). */
+/** Wake the brain API before the first chat (via proxy). */
 export async function warmupBrainApi(): Promise<void> {
   try {
-    await fetch(`${getApiBaseUrl()}/health`, { method: "GET" });
+    await fetch(`${getApiBaseUrl()}/health`, { method: "GET", cache: "no-store" });
   } catch {
     // Non-fatal; chat will still attempt the real request.
   }
 }
 
-/** POST /chat — full answer (non-streaming). */
+/** POST /chat — via dedicated `/api/chat` route (not catch-all `/api/brain/*`). */
 export async function sendChat(
   userId: string,
   sessionId: string,
   message: string
 ): Promise<ChatResponse> {
-  const res = await apiFetch("/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      user_id: userId,
-      session_id: sessionId,
-      message,
-    }),
+  const body = JSON.stringify({
+    user_id: userId,
+    session_id: sessionId,
+    message,
   });
+
+  let res: Response;
+  try {
+    res = await chatFetch(body);
+  } catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") {
+      const sec = Math.round(getClientChatTimeoutMs() / 1000);
+      throw new Error(
+        `Chat timed out after ${sec}s. Set NEXT_PUBLIC_API_TIMEOUT_SEC (browser) and BRAIN_PROXY_TIMEOUT_SEC (server) in .env.`
+      );
+    }
+    throw new Error(
+      `Chat request failed. Is the backend reachable via BACKEND_API_URL? ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
   if (!res.ok) {
     throw new Error(await parseError(res, `Chat failed (${res.status})`));
   }
@@ -285,65 +337,144 @@ function parseAnalysisState(
   return analysis as Record<string, unknown>;
 }
 
-/** Pull evidence items from brain `state.analysis` for the sources panel. */
+type RetrievalChunk = {
+  text?: string;
+  quote?: string;
+  video_id?: string;
+  start_time?: number | null;
+  end_time?: number | null;
+  rerank_score?: number | null;
+};
+
+function videoTitleFromState(
+  state: Record<string, unknown>,
+  videoId: string
+): string | null {
+  const meta = state.metadata;
+  if (!meta || typeof meta !== "object") return null;
+  const row = (meta as Record<string, unknown>)[videoId];
+  if (!row || typeof row !== "object") return null;
+  const title = (row as Record<string, unknown>).title;
+  return typeof title === "string" && title.trim() ? title.trim() : null;
+}
+
+/** Pull retrieved chunks + evidence from brain chat `state` for the sources panel. */
 export function citationsFromState(
   state: Record<string, unknown>,
   videoIds: string[]
 ): Citation[] {
-  const a = parseAnalysisState(state);
-  if (!a) return [];
   const labelFor = (videoId: string | null | undefined) => {
     if (!videoId) return "Video";
-    const i = videoIds.indexOf(videoId);
-    if (i === 0) return "Video A";
-    if (i === 1) return "Video B";
+    const title = videoTitleFromState(state, videoId);
+    const slot =
+      videoIds.indexOf(videoId) === 0
+        ? "Video A"
+        : videoIds.indexOf(videoId) === 1
+          ? "Video B"
+          : null;
+    if (title && slot) return `${slot} · ${title}`;
+    if (slot) return slot;
+    if (title) return title;
     return videoId;
   };
 
   const out: Citation[] = [];
   const seen = new Set<string>();
 
-  const add = (ev: Evidence) => {
-    const vid = ev.video_id ?? "";
-    const key = `${vid}:${ev.start_time}:${ev.quote?.slice(0, 40)}`;
-    if (!ev.quote || seen.has(key)) return;
+  const add = (
+    videoId: string,
+    start: number | null | undefined,
+    end: number | null | undefined,
+    excerpt: string,
+    rerankScore?: number | null
+  ) => {
+    const text = excerpt.trim();
+    if (!text) return;
+    const key = `${videoId}:${start ?? ""}:${text.slice(0, 48)}`;
+    if (seen.has(key)) return;
     seen.add(key);
     out.push({
       chunk_id: key,
-      video_label: labelFor(ev.video_id),
-      video_id: vid,
-      start_sec: ev.start_time ?? null,
-      end_sec: ev.end_time ?? null,
-      excerpt: ev.quote.slice(0, 400),
+      video_label: labelFor(videoId),
+      video_id: videoId,
+      start_sec: start ?? null,
+      end_sec: end ?? null,
+      excerpt: text.slice(0, 400),
+      rerank_score: rerankScore ?? null,
     });
   };
 
-  const collect = (obj: unknown) => {
-    if (!obj || typeof obj !== "object") return;
-    const o = obj as Record<string, unknown>;
-    if (Array.isArray(o.evidence)) {
-      for (const e of o.evidence) add(e as Evidence);
+  const addChunk = (raw: RetrievalChunk) => {
+    const excerpt = raw.text ?? raw.quote ?? "";
+    add(
+      String(raw.video_id ?? ""),
+      raw.start_time,
+      raw.end_time,
+      excerpt,
+      raw.rerank_score
+    );
+  };
+
+  const addEvidence = (ev: Evidence) => {
+    if (!ev.quote) return;
+    add(
+      String(ev.video_id ?? ""),
+      ev.start_time,
+      ev.end_time,
+      ev.quote
+    );
+  };
+
+  // Primary: RAG context chunks used to ground the answer.
+  if (Array.isArray(state.context_chunks)) {
+    for (const raw of state.context_chunks) {
+      if (raw && typeof raw === "object") addChunk(raw as RetrievalChunk);
     }
-    if (o.per_video_summary && typeof o.per_video_summary === "object") {
+  }
+
+  const ctx = state.context;
+  if (ctx && typeof ctx === "object") {
+    const chunksByVideo = (ctx as Record<string, unknown>).chunks_by_video;
+    if (chunksByVideo && typeof chunksByVideo === "object") {
+      for (const chunks of Object.values(chunksByVideo)) {
+        if (!Array.isArray(chunks)) continue;
+        for (const raw of chunks) {
+          if (raw && typeof raw === "object") addChunk(raw as RetrievalChunk);
+        }
+      }
+    }
+  }
+
+  // Fallback: analysis evidence quotes.
+  const a = parseAnalysisState(state);
+  if (a) {
+    const collect = (obj: unknown) => {
+      if (!obj || typeof obj !== "object") return;
+      const o = obj as Record<string, unknown>;
+      if (Array.isArray(o.evidence)) {
+        for (const e of o.evidence) addEvidence(e as Evidence);
+      }
+      if (o.per_video_summary && typeof o.per_video_summary === "object") {
+        for (const v of Object.values(
+          o.per_video_summary as Record<string, unknown>
+        )) {
+          collect(v);
+        }
+      }
+      if (Array.isArray(o.notable_moments)) {
+        for (const e of o.notable_moments) addEvidence(e as Evidence);
+      }
+    };
+
+    collect(a.comparison);
+    collect(a.virality);
+    collect(a.timeline);
+    if (a.per_video_summary && typeof a.per_video_summary === "object") {
       for (const v of Object.values(
-        o.per_video_summary as Record<string, unknown>
+        a.per_video_summary as Record<string, unknown>
       )) {
         collect(v);
       }
-    }
-    if (o.notable_moments && Array.isArray(o.notable_moments)) {
-      for (const e of o.notable_moments) add(e as Evidence);
-    }
-  };
-
-  collect(a.comparison);
-  collect(a.virality);
-  collect(a.timeline);
-  if (a.per_video_summary && typeof a.per_video_summary === "object") {
-    for (const v of Object.values(
-      a.per_video_summary as Record<string, unknown>
-    )) {
-      collect(v);
     }
   }
 

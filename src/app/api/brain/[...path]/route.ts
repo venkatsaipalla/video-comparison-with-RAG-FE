@@ -1,5 +1,8 @@
 import { proxyToBrainUrl } from "@/lib/brain-proxy";
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+
 type Ctx = { params: Promise<{ path: string[] }> };
 
 async function handle(req: Request, ctx: Ctx) {
